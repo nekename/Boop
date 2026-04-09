@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from time import time
-from typing import List
+from typing import List, Tuple
 from urllib.request import urlopen
 
 import discord
@@ -30,12 +30,62 @@ class Faq(Cog):
         self._cache: List[FaqEntry] = []
         self._cache_expiry = 0.0
         self._cache_ttl_seconds = 900
+        self._auto_reply_min_score = 95
+
+        self._faq_reply_context_menu = app_commands.ContextMenu(
+            name = "Reply With FAQ Match",
+            callback = self.reply_with_faq_match
+        )
+
+        existing = self.bot.tree.get_command(
+            self._faq_reply_context_menu.name,
+            type = discord.AppCommandType.message
+        )
+        if existing is None:
+            self.bot.tree.add_command(self._faq_reply_context_menu)
+
+    async def cog_unload(self):
+        self.bot.tree.remove_command(
+            self._faq_reply_context_menu.name,
+            type = discord.AppCommandType.message
+        )
 
     @app_commands.command(description = "Searches the OpenDeck FAQ for your question")
     @app_commands.describe(query = "Type any OpenDeck question or keywords")
     async def faq(self, ctx: discord.Interaction, query: str):
         await ctx.response.defer(thinking = True)
+        embed, _ = await self._build_faq_search_embed(query)
+        await ctx.followup.send(embed = embed)
 
+    async def reply_with_faq_match(self, interaction: discord.Interaction, message: discord.Message):
+        await interaction.response.defer(ephemeral = True, thinking = True)
+
+        query = (message.content or "").strip()
+        if not query:
+            await interaction.followup.send(
+                "That message has no text content for FAQ matching.",
+                ephemeral = True
+            )
+            return
+
+        embed, matched = await self._build_faq_search_embed(query)
+        if not matched:
+            await interaction.followup.send(embed = embed, ephemeral = True)
+            return
+
+        try:
+            await message.reply(embed = embed)
+            await interaction.followup.send(
+                "Posted an FAQ reply to that message.",
+                ephemeral = True
+            )
+        except Exception:
+            await interaction.followup.send(
+                "I found a match but could not post the reply in that channel.",
+                ephemeral = True
+            )
+
+    async def _build_faq_search_embed(self, query: str) -> Tuple[discord.Embed, bool]:
         try:
             entries = await self._get_faq_entries()
         except Exception:
@@ -45,8 +95,7 @@ class Faq(Cog):
                 description = "I could not fetch the FAQ right now. Please try again in a moment."
             )
             embed.add_field(name = "Source", value = FAQ_PAGE_URL, inline = False)
-            await ctx.followup.send(embed = embed)
-            return
+            return embed, False
 
         if not entries:
             embed = discord.Embed(
@@ -55,8 +104,7 @@ class Faq(Cog):
                 description = "I fetched the FAQ page but could not parse any questions."
             )
             embed.add_field(name = "Source", value = FAQ_PAGE_URL, inline = False)
-            await ctx.followup.send(embed = embed)
-            return
+            return embed, False
 
         scored = sorted(
             ((self._score_entry(query, entry), entry) for entry in entries),
@@ -77,8 +125,7 @@ class Faq(Cog):
                 embed.add_field(name = "Closest matches", value = "\n".join(f"- {item}" for item in suggestions), inline = False)
 
             embed.add_field(name = "OpenDeck FAQ", value = FAQ_PAGE_URL, inline = False)
-            await ctx.followup.send(embed = embed)
-            return
+            return embed, False
 
         answer = self._trim_answer(best_entry.answer)
         embed = discord.Embed(
@@ -89,7 +136,7 @@ class Faq(Cog):
         embed.add_field(name = "Section", value = best_entry.section, inline = True)
         embed.add_field(name = "Source", value = FAQ_PAGE_URL, inline = True)
         embed.set_footer(text = "Result from OpenDeck FAQ")
-        await ctx.followup.send(embed = embed)
+        return embed, True
 
     async def _get_faq_entries(self) -> List[FaqEntry]:
         now = time()
